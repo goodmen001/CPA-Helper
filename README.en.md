@@ -23,6 +23,7 @@ It separates API keys and usage data by user: each user can create and manage th
 - [Configuration](#configuration)
 - [Development and Checks](#development-and-checks)
 - [Contributing](#contributing)
+- [Acknowledgements](#acknowledgements)
 - [License](#license)
 
 ## Features
@@ -342,6 +343,10 @@ Issues and pull requests are welcome. Before submitting changes, please check:
 - Frontend passes `npm run lint` and `npm run build`.
 - Relational schema changes include Alembic migration files.
 - Local runtime data, virtual environments, build outputs and secrets are not committed.
+
+## Acknowledgements
+
+Thanks to the [Linux.do](https://linux.do/) site and community for support and inspiration around the project.
 
 ## License
 
