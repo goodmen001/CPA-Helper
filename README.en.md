@@ -2,7 +2,7 @@
   <img src="frontend/public/logo.png" alt="CPA-Helper Logo" width="104" height="104" />
   <h1>CPA-Helper</h1>
   <p><strong>A local self-hosted multi-user admin panel for CLIProxyAPI</strong></p>
-  <p>Usage analytics · Request tracing · User roles · API key management · Model pricing · Codex auth file inspection</p>
+  <p>Usage analytics · Request tracing · User role controls · API key management · Model pricing maintenance · Codex auth file inspection</p>
   <p>
     <strong>English</strong>
     <span> · </span>

@@ -2,7 +2,7 @@
   <img src="frontend/public/logo.png" alt="CPA-Helper Logo" width="104" height="104" />
   <h1>CPA-Helper</h1>
   <p><strong>面向 CLIProxyAPI 的本地自托管多用户管理面板</strong></p>
-  <p>用量统计 · 请求追踪 · 用户权限 · API Key 管理 · 模型价格 · Codex 凭证巡检</p>
+  <p>用量统计 · 请求追踪 · 用户权限调整 · API 密钥管理 · 模型价格维护 · Codex 凭证巡检</p>
   <p>
     <a href="README.en.md">English</a>
     <span> · </span>
