@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -26,6 +27,8 @@ type keeperStatusResponse struct {
 type keeperAccountsResponse struct {
 	Items []struct {
 		Name           string  `json:"name"`
+		AccountType    *string `json:"account_type"`
+		Priority       *int    `json:"priority"`
 		PrimaryResetAt *string `json:"primary_reset_at"`
 		LastCheckedAt  *string `json:"last_checked_at"`
 		LastHealthyAt  *string `json:"last_healthy_at"`
@@ -197,6 +200,202 @@ func TestKeeperStatusRestoresRecentLogFileLines(t *testing.T) {
 	if len(status.Logs) != 1 || status.Logs[0] != expected {
 		t.Fatalf("restored logs = %#v, want %#v", status.Logs, []string{expected})
 	}
+}
+
+func TestKeeperRunMaintainsSystemPriorityRules(t *testing.T) {
+	dataDir := t.TempDir()
+	t.Setenv("CPA_HELPER_DATA_DIR", dataDir)
+
+	authNames := []string{
+		"free-null.json",
+		"free-quota-null.json",
+		"plus-wrong.json",
+		"manual-quota-high.json",
+		"manual-high.json",
+		"manual-low.json",
+	}
+	usagePercents := map[string]int{
+		"free-quota-null.json":   100,
+		"manual-quota-high.json": 100,
+	}
+	authDetails := map[string]map[string]any{
+		"free-null.json": {
+			"name":         "free-null.json",
+			"type":         "codex",
+			"email":        "user001@example.com",
+			"account_type": "free",
+			"disabled":     false,
+			"priority":     nil,
+			"access_token": "test-token",
+		},
+		"free-quota-null.json": {
+			"name":         "free-quota-null.json",
+			"type":         "codex",
+			"email":        "user005@example.com",
+			"account_type": "free",
+			"disabled":     false,
+			"priority":     nil,
+			"access_token": "test-token",
+		},
+		"plus-wrong.json": {
+			"name":         "plus-wrong.json",
+			"type":         "codex",
+			"email":        "user002@example.com",
+			"account_type": "plus",
+			"disabled":     false,
+			"priority":     0,
+			"access_token": "test-token",
+		},
+		"manual-quota-high.json": {
+			"name":         "manual-quota-high.json",
+			"type":         "codex",
+			"email":        "user006@example.com",
+			"account_type": "plus",
+			"disabled":     false,
+			"priority":     100,
+			"access_token": "test-token",
+		},
+		"manual-high.json": {
+			"name":         "manual-high.json",
+			"type":         "codex",
+			"email":        "user003@example.com",
+			"account_type": "plus",
+			"disabled":     false,
+			"priority":     21,
+			"access_token": "test-token",
+		},
+		"manual-low.json": {
+			"name":         "manual-low.json",
+			"type":         "codex",
+			"email":        "user004@example.com",
+			"account_type": "team",
+			"disabled":     false,
+			"priority":     -2,
+			"access_token": "test-token",
+		},
+	}
+	var mu sync.Mutex
+	patches := map[string][]int{}
+
+	cpa := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v0/management/auth-files":
+			files := make([]map[string]any, 0, len(authNames))
+			for _, name := range authNames {
+				files = append(files, map[string]any{"name": name, "type": "codex"})
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"files": files})
+		case r.Method == http.MethodGet && r.URL.Path == "/v0/management/auth-files/download":
+			detail, ok := authDetails[r.URL.Query().Get("name")]
+			if !ok {
+				http.NotFound(w, r)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(detail)
+		case r.Method == http.MethodPost && r.URL.Path == "/v0/management/api-call":
+			var payload struct {
+				AuthIndex string `json:"auth_index"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&payload)
+			usedPercent := usagePercents[payload.AuthIndex]
+			if usedPercent == 0 {
+				usedPercent = 10
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status_code": 200,
+				"body": map[string]any{
+					"rate_limit": map[string]any{
+						"primary_window": map[string]any{
+							"used_percent":        usedPercent,
+							"reset_after_seconds": 3600,
+						},
+					},
+				},
+			})
+		case r.Method == http.MethodPatch && r.URL.Path == "/v0/management/auth-files/fields":
+			var payload struct {
+				Name     string `json:"name"`
+				Priority *int   `json:"priority"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			if payload.Priority == nil {
+				http.Error(w, "priority is required", http.StatusBadRequest)
+				return
+			}
+			mu.Lock()
+			patches[payload.Name] = append(patches[payload.Name], *payload.Priority)
+			if detail, ok := authDetails[payload.Name]; ok {
+				detail["priority"] = *payload.Priority
+			}
+			mu.Unlock()
+			_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer cpa.Close()
+
+	app, err := backendApp.New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+
+	handler := app.Routes()
+	cookies := requestJSON(t, handler, http.MethodPost, "/api/auth/setup", map[string]any{
+		"username": "admin",
+		"password": "test-password",
+		"nickname": "Admin",
+	}, nil, nil)
+	requestJSON(t, handler, http.MethodPut, "/api/settings", map[string]any{
+		"cliaproxy_url":     cpa.URL,
+		"management_key":    "test-management-key",
+		"collector_enabled": false,
+	}, cookies, nil)
+	requestJSON(t, handler, http.MethodPut, "/api/codex-keeper/settings", map[string]any{
+		"schedule_cron":       "0 0 29 2 *",
+		"dry_run":             false,
+		"quota_threshold":     100,
+		"worker_threads":      1,
+		"cpa_timeout_seconds": 1,
+	}, cookies, nil)
+	requestJSON(t, handler, http.MethodPost, "/api/codex-keeper/run-once", nil, cookies, nil)
+	response := waitForKeeperAccounts(t, handler, cookies, len(authNames))
+
+	expectedPriorities := map[string]int{
+		"free-null.json":         0,
+		"free-quota-null.json":   -1,
+		"plus-wrong.json":        4,
+		"manual-quota-high.json": -1,
+		"manual-high.json":       21,
+		"manual-low.json":        -2,
+	}
+	assertKeeperPriorities(t, response, expectedPriorities)
+
+	mu.Lock()
+	expectedPatches := map[string][]int{
+		"free-null.json":         {0},
+		"free-quota-null.json":   {-1},
+		"plus-wrong.json":        {4},
+		"manual-quota-high.json": {-1},
+	}
+	assertKeeperPriorityPatchesLocked(t, patches, expectedPatches)
+	mu.Unlock()
+
+	usagePercents["manual-quota-high.json"] = 10
+	requestJSON(t, handler, http.MethodPost, "/api/codex-keeper/run-once", nil, cookies, nil)
+	response = waitForKeeperAccounts(t, handler, cookies, len(authNames))
+	expectedPriorities["manual-quota-high.json"] = 100
+	assertKeeperPriorities(t, response, expectedPriorities)
+
+	mu.Lock()
+	expectedPatches["manual-quota-high.json"] = []int{-1, 100}
+	assertKeeperPriorityPatchesLocked(t, patches, expectedPatches)
+	mu.Unlock()
 }
 
 func TestKeeperAccountsReturnBeijingOffsetTimeStrings(t *testing.T) {
@@ -380,6 +579,58 @@ func assertStandardKeeperLogLine(t *testing.T, line string) {
 	pattern := regexp.MustCompile(`^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3} - app\.services\.codex_keeper_service - INFO - .+`)
 	if !pattern.MatchString(line) {
 		t.Fatalf("keeper log line %q does not match standard format", line)
+	}
+}
+
+func waitForKeeperAccounts(t *testing.T, handler http.Handler, cookies []*http.Cookie, expected int) keeperAccountsResponse {
+	t.Helper()
+	response := keeperAccountsResponse{}
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		response = keeperAccountsResponse{}
+		requestJSON(t, handler, http.MethodGet, "/api/codex-keeper/accounts", nil, cookies, &response)
+		status := keeperStatusResponse{}
+		requestJSON(t, handler, http.MethodGet, "/api/codex-keeper/status", nil, cookies, &status)
+		if len(response.Items) == expected && !status.Running {
+			return response
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("accounts length = %d, want %d after keeper run completed", len(response.Items), expected)
+	return response
+}
+
+func assertKeeperPriorities(t *testing.T, response keeperAccountsResponse, expected map[string]int) {
+	t.Helper()
+	priorities := map[string]int{}
+	for _, item := range response.Items {
+		if item.Priority == nil {
+			t.Fatalf("%s priority is nil, want maintained priority", item.Name)
+		}
+		priorities[item.Name] = *item.Priority
+	}
+	for name, want := range expected {
+		if got := priorities[name]; got != want {
+			t.Fatalf("%s priority = %d, want %d", name, got, want)
+		}
+	}
+}
+
+func assertKeeperPriorityPatchesLocked(t *testing.T, patches map[string][]int, expected map[string][]int) {
+	t.Helper()
+	if len(patches) != len(expected) {
+		t.Fatalf("priority patches = %#v, want %#v", patches, expected)
+	}
+	for name, want := range expected {
+		got := patches[name]
+		if len(got) != len(want) {
+			t.Fatalf("%s patched priorities = %#v, want %#v", name, got, want)
+		}
+		for i := range want {
+			if got[i] != want[i] {
+				t.Fatalf("%s patched priorities = %#v, want %#v", name, got, want)
+			}
+		}
 	}
 }
 

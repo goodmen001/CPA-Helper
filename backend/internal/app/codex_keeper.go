@@ -158,6 +158,8 @@ type keeperAccountResult struct {
 	Email                *string
 	AccountType          *string
 	Priority             *int
+	RestorePriority      *int
+	ClearRestorePriority bool
 	Disabled             *bool
 	PrimaryUsedPercent   *int
 	SecondaryUsedPercent *int
@@ -966,21 +968,24 @@ func (a *App) processKeeperAuth(ctx context.Context, cfg AppConfig, authInfo map
 	result.QuotaThreshold = &cfg.CodexKeeper.QuotaThreshold
 	result.Result = "healthy"
 
-	action := a.applyKeeperPriorityPolicy(ctx, cfg, name, result.AccountType, result.Priority, usage)
+	var restorePriority *int
+	if state, err := a.getKeeperState(ctx, name); err == nil {
+		restorePriority = state.RestorePriority
+	}
+	action := a.applyKeeperPriorityPolicy(ctx, cfg, name, result.AccountType, result.Priority, restorePriority, usage)
 	if action != nil {
-		result.LatestAction = action
-		if strings.Contains(*action, "降为低优先级") {
+		result.LatestAction = &action.Message
+		if action.Result == "priority_degraded" {
 			result.Result = "priority_degraded"
-			low := -1
-			result.Priority = &low
+			result.Priority = action.Priority
+			result.RestorePriority = action.RestorePriority
 		}
-		if strings.Contains(*action, "恢复") || strings.Contains(*action, "应用类型优先级") {
+		if action.Result == "priority_restored" {
 			result.Result = "priority_restored"
-			if next := keeperPriorityForType(result.AccountType, cfg.CodexKeeperPriorityRule); next != nil {
-				result.Priority = next
-			}
+			result.Priority = action.Priority
+			result.ClearRestorePriority = true
 		}
-		logFn(name + ": " + *action)
+		logFn(name + ": " + action.Message)
 	} else {
 		accountType := "unknown"
 		if result.AccountType != nil && strings.TrimSpace(*result.AccountType) != "" {
@@ -988,53 +993,92 @@ func (a *App) processKeeperAuth(ctx context.Context, cfg AppConfig, authInfo map
 		}
 		logFn(fmt.Sprintf("%s: 巡检正常，类型 %s", name, accountType))
 	}
+	if result.Priority == nil || *result.Priority != -1 {
+		result.ClearRestorePriority = true
+	}
 	result.LastError = nil
 	_ = a.upsertKeeperState(ctx, result)
 	return result
 }
 
-func (a *App) applyKeeperPriorityPolicy(ctx context.Context, cfg AppConfig, name string, accountType *string, priority *int, usage keeperUsageInfo) *string {
+type keeperPriorityPolicyAction struct {
+	Message         string
+	Result          string
+	Priority        *int
+	RestorePriority *int
+}
+
+func (a *App) applyKeeperPriorityPolicy(ctx context.Context, cfg AppConfig, name string, accountType *string, priority *int, restorePriority *int, usage keeperUsageInfo) *keeperPriorityPolicyAction {
 	quotaReached := usage.PrimaryUsedPercent >= cfg.CodexKeeper.QuotaThreshold ||
 		(usage.SecondaryUsedPercent != nil && *usage.SecondaryUsedPercent >= cfg.CodexKeeper.QuotaThreshold)
 	currentPriority := priority
-	if currentPriority == nil {
-		currentPriority = keeperPriorityForType(accountType, cfg.CodexKeeperPriorityRule)
-	}
-	if currentPriority != nil && *currentPriority < -1 {
-		message := "保持低优先级：priority 小于 -1"
-		return &message
-	}
+	next := keeperPriorityForType(accountType, cfg.CodexKeeperPriorityRule)
 	if quotaReached {
-		if currentPriority == nil || *currentPriority == -1 {
+		if currentPriority != nil && *currentPriority <= -1 {
+			return nil
+		}
+		restoreTo := restorePriority
+		if restoreTo == nil {
+			restoreTo = next
+		}
+		if currentPriority != nil && *currentPriority > 20 {
+			restoreTo = currentPriority
+		}
+		if restoreTo == nil {
+			restoreTo = currentPriority
+		}
+		if restoreTo == nil {
 			return nil
 		}
 		message := fmt.Sprintf("降为低优先级：额度使用率达到阈值 %d%%", cfg.CodexKeeper.QuotaThreshold)
 		if cfg.CodexKeeper.DryRun {
 			message = "模拟" + message
-			return &message
+			low := -1
+			return &keeperPriorityPolicyAction{Message: message, Result: "priority_degraded", Priority: &low, RestorePriority: restoreTo}
 		}
 		low := -1
 		if err := a.setKeeperRemotePriority(ctx, cfg, name, &low); err != nil {
 			message = "写入低优先级失败：" + err.Error()
-			return &message
+			return &keeperPriorityPolicyAction{Message: message}
 		}
-		return &message
+		return &keeperPriorityPolicyAction{Message: message, Result: "priority_degraded", Priority: &low, RestorePriority: restoreTo}
 	}
 	if currentPriority != nil && *currentPriority == -1 {
-		next := keeperPriorityForType(accountType, cfg.CodexKeeperPriorityRule)
-		if next == nil {
+		restoreTo := restorePriority
+		if restoreTo == nil {
+			restoreTo = next
+		}
+		if restoreTo == nil {
 			return nil
 		}
+		message := fmt.Sprintf("恢复优先级：priority %d", *restoreTo)
+		if cfg.CodexKeeper.DryRun {
+			message = "模拟" + message
+			return &keeperPriorityPolicyAction{Message: message, Result: "priority_restored", Priority: restoreTo}
+		}
+		if err := a.setKeeperRemotePriority(ctx, cfg, name, restoreTo); err != nil {
+			message = "恢复优先级失败：" + err.Error()
+			return &keeperPriorityPolicyAction{Message: message}
+		}
+		return &keeperPriorityPolicyAction{Message: message, Result: "priority_restored", Priority: restoreTo}
+	}
+	if currentPriority != nil && (*currentPriority < -1 || *currentPriority > 20) {
+		return nil
+	}
+	if next == nil {
+		return nil
+	}
+	if currentPriority == nil || *currentPriority != *next {
 		message := fmt.Sprintf("应用类型优先级：%s -> priority %d", valueOr(accountType, "unknown"), *next)
 		if cfg.CodexKeeper.DryRun {
 			message = "模拟" + message
-			return &message
+			return &keeperPriorityPolicyAction{Message: message, Result: "priority_restored", Priority: next}
 		}
 		if err := a.setKeeperRemotePriority(ctx, cfg, name, next); err != nil {
-			message = "恢复高优先级失败：" + err.Error()
-			return &message
+			message = "写入类型优先级失败：" + err.Error()
+			return &keeperPriorityPolicyAction{Message: message}
 		}
-		return &message
+		return &keeperPriorityPolicyAction{Message: message, Result: "priority_restored", Priority: next}
 	}
 	return nil
 }
@@ -1244,15 +1288,20 @@ func (a *App) upsertKeeperState(ctx context.Context, result keeperAccountResult)
 	}
 	_, err := a.db.ExecContext(ctx, `
 		INSERT INTO codex_keeper_auth_states (
-			auth_name, email, account_type, disabled, priority, latest_action, last_error,
+			auth_name, email, account_type, disabled, priority, restore_priority, latest_action, last_error,
 			last_status_code, primary_used_percent, secondary_used_percent, quota_threshold,
 			primary_reset_at, secondary_reset_at, last_checked_at, last_healthy_at, created_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(auth_name) DO UPDATE SET
 			email = excluded.email,
 			account_type = excluded.account_type,
 			disabled = excluded.disabled,
 			priority = excluded.priority,
+			restore_priority = CASE
+				WHEN ? THEN NULL
+				WHEN excluded.restore_priority IS NOT NULL THEN excluded.restore_priority
+				ELSE codex_keeper_auth_states.restore_priority
+			END,
 			latest_action = excluded.latest_action,
 			last_error = excluded.last_error,
 			last_status_code = excluded.last_status_code,
@@ -1264,7 +1313,7 @@ func (a *App) upsertKeeperState(ctx context.Context, result keeperAccountResult)
 			last_checked_at = excluded.last_checked_at,
 			last_healthy_at = COALESCE(excluded.last_healthy_at, codex_keeper_auth_states.last_healthy_at),
 			updated_at = excluded.updated_at
-	`, result.Name, result.Email, result.AccountType, boolValue(result.Disabled), result.Priority, result.LatestAction, result.LastError, result.LastStatusCode, result.PrimaryUsedPercent, result.SecondaryUsedPercent, result.QuotaThreshold, dbTimePtr(result.PrimaryResetAt), dbTimePtr(result.SecondaryResetAt), checkedAt, lastHealthy, now, now)
+	`, result.Name, result.Email, result.AccountType, boolValue(result.Disabled), result.Priority, result.RestorePriority, result.LatestAction, result.LastError, result.LastStatusCode, result.PrimaryUsedPercent, result.SecondaryUsedPercent, result.QuotaThreshold, dbTimePtr(result.PrimaryResetAt), dbTimePtr(result.SecondaryResetAt), checkedAt, lastHealthy, now, now, result.ClearRestorePriority)
 	return err
 }
 
