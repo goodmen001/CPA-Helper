@@ -7,6 +7,7 @@ frontend/dist/
 backend/dist/
 backend/build/
 backend/bin/
+backend/internal/app/web/dist/
 backend/cpa-helper
 backend/cpa-helper.exe
 __pycache__/

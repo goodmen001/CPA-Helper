@@ -7,11 +7,13 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"io/fs"
 	"log"
 	"math"
 	"net/http"
 	"net/url"
 	"os"
+	slashpath "path"
 	"path/filepath"
 	"reflect"
 	"sort"
@@ -19,6 +21,7 @@ import (
 	"strings"
 	"time"
 
+	"cpa-helper/backend/internal/app/web"
 	"cpa-helper/backend/internal/platform/cpahttp"
 	"cpa-helper/backend/internal/security"
 	backendMigrations "cpa-helper/backend/migrations"
@@ -46,6 +49,8 @@ type App struct {
 	repoRoot     string
 	dataDir      string
 	frontendDist string
+	frontendFS   fs.FS
+	frontendEnv  bool
 	collector    *CollectorRunner
 	keeper       *KeeperRunner
 }
@@ -105,11 +110,15 @@ func New() (*App, error) {
 	}
 	db.SetMaxOpenConns(1)
 
+	frontendDist, frontendEnv := frontendDistDir(repoRoot)
+	frontendFS, _ := web.DistFS()
 	app := &App{
 		db:           db,
 		repoRoot:     repoRoot,
 		dataDir:      dataDir,
-		frontendDist: frontendDistDir(repoRoot),
+		frontendDist: frontendDist,
+		frontendFS:   frontendFS,
+		frontendEnv:  frontendEnv,
 	}
 	if err := app.runMigrations(context.Background()); err != nil {
 		db.Close()
@@ -147,23 +156,56 @@ func detectRepoRoot() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if filepath.Base(cwd) == "backend" {
-		return filepath.Abs(filepath.Dir(cwd))
+	executablePath, _ := os.Executable()
+	return detectRepoRootFrom(cwd, executablePath)
+}
+
+func detectRepoRootFrom(cwd, executablePath string) (string, error) {
+	if root, ok := findProjectRoot(cwd); ok {
+		return root, nil
 	}
-	if _, err := os.Stat(filepath.Join(cwd, "frontend")); err == nil {
-		return filepath.Abs(cwd)
-	}
-	if _, err := os.Stat(filepath.Join(cwd, "..", "frontend")); err == nil {
-		return filepath.Abs(filepath.Join(cwd, ".."))
+	if executablePath != "" {
+		executableDir := filepath.Dir(executablePath)
+		if root, ok := findProjectRoot(executableDir); ok {
+			return root, nil
+		}
+		return filepath.Abs(executableDir)
 	}
 	return filepath.Abs(cwd)
 }
 
-func frontendDistDir(repoRoot string) string {
-	if value := strings.TrimSpace(os.Getenv("CPA_HELPER_FRONTEND_DIST")); value != "" {
-		return value
+func findProjectRoot(start string) (string, bool) {
+	current, err := filepath.Abs(start)
+	if err != nil {
+		return "", false
 	}
-	return filepath.Join(repoRoot, "frontend", "dist")
+	for {
+		if isProjectRoot(current) {
+			return current, true
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return "", false
+		}
+		current = parent
+	}
+}
+
+func isProjectRoot(path string) bool {
+	if _, err := os.Stat(filepath.Join(path, "frontend")); err != nil {
+		return false
+	}
+	if _, err := os.Stat(filepath.Join(path, "backend")); err != nil {
+		return false
+	}
+	return true
+}
+
+func frontendDistDir(repoRoot string) (string, bool) {
+	if value := strings.TrimSpace(os.Getenv("CPA_HELPER_FRONTEND_DIST")); value != "" {
+		return value, true
+	}
+	return filepath.Join(repoRoot, "frontend", "dist"), false
 }
 
 func (a *App) Routes() http.Handler {
@@ -279,26 +321,80 @@ func (a *App) handleSPA(w http.ResponseWriter, r *http.Request) error {
 	if strings.HasPrefix(r.URL.Path, "/api/") {
 		return notFoundError("Not Found")
 	}
-	if r.URL.Path == "/" {
-		return a.serveIndex(w, r)
+	if a.frontendEnv {
+		served, err := a.serveExternalSPA(w, r)
+		if err != nil || served {
+			return err
+		}
+		return a.serveFrontendNotBuilt(w)
 	}
-	requested := filepath.Clean(strings.TrimPrefix(r.URL.Path, "/"))
-	staticPath := filepath.Join(a.frontendDist, requested)
-	if insideDir(a.frontendDist, staticPath) {
-		if info, err := os.Stat(staticPath); err == nil && !info.IsDir() {
-			http.ServeFile(w, r, staticPath)
-			return nil
+	if a.frontendFS != nil {
+		served, err := a.serveEmbeddedSPA(w, r)
+		if err != nil || served {
+			return err
 		}
 	}
-	return a.serveIndex(w, r)
+	served, err := a.serveExternalSPA(w, r)
+	if err != nil || served {
+		return err
+	}
+	return a.serveFrontendNotBuilt(w)
 }
 
-func (a *App) serveIndex(w http.ResponseWriter, r *http.Request) error {
+func (a *App) serveExternalSPA(w http.ResponseWriter, r *http.Request) (bool, error) {
+	requested := cleanSPAPath(r.URL.Path)
+	if requested != "" {
+		staticPath := filepath.Join(a.frontendDist, filepath.FromSlash(requested))
+		if insideDir(a.frontendDist, staticPath) {
+			if info, err := os.Stat(staticPath); err == nil && !info.IsDir() {
+				http.ServeFile(w, r, staticPath)
+				return true, nil
+			}
+		}
+	}
 	indexPath := filepath.Join(a.frontendDist, "index.html")
 	if _, err := os.Stat(indexPath); err == nil {
 		http.ServeFile(w, r, indexPath)
-		return nil
+		return true, nil
 	}
+	return false, nil
+}
+
+func (a *App) serveEmbeddedSPA(w http.ResponseWriter, r *http.Request) (bool, error) {
+	requested := cleanSPAPath(r.URL.Path)
+	if requested != "" && fs.ValidPath(requested) {
+		if info, err := fs.Stat(a.frontendFS, requested); err == nil && !info.IsDir() {
+			return true, serveFSFile(w, r, a.frontendFS, requested)
+		}
+	}
+	if _, err := fs.Stat(a.frontendFS, "index.html"); err == nil {
+		return true, serveFSFile(w, r, a.frontendFS, "index.html")
+	}
+	return false, nil
+}
+
+func cleanSPAPath(requestPath string) string {
+	cleaned := slashpath.Clean("/" + strings.TrimPrefix(requestPath, "/"))
+	if cleaned == "/" {
+		return ""
+	}
+	return strings.TrimPrefix(cleaned, "/")
+}
+
+func serveFSFile(w http.ResponseWriter, r *http.Request, filesystem fs.FS, name string) error {
+	data, err := fs.ReadFile(filesystem, name)
+	if err != nil {
+		return err
+	}
+	info, err := fs.Stat(filesystem, name)
+	if err != nil {
+		return err
+	}
+	http.ServeContent(w, r, slashpath.Base(name), info.ModTime(), bytes.NewReader(data))
+	return nil
+}
+
+func (a *App) serveFrontendNotBuilt(w http.ResponseWriter) error {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "frontend_not_built"})
 	return nil
 }
